@@ -1,0 +1,409 @@
+#!/bin/bash
+#
+# Seer System Activity Monitor
+# Robust activity tracking with duplicate prevention and accurate timestamps
+#
+
+set -euo pipefail
+
+# === CONFIGURATION ===
+DB_PATH="/home/admin/.node-red/seer_database/seer.db"
+STATE_DIR="/var/lib/seer"
+LOCK_FILE="/var/run/seer_monitor.lock"
+FIREWALL_LOG="/var/log/seer/firewall.log"
+AUTH_LOG="/var/log/auth.log"
+SYSLOG="/var/log/syslog"
+AUDIT_LOG="/var/log/audit/audit.log"
+SURICATA_EVE_LOG="/var/log/suricata/eve.json"
+SURICATA_FAST_LOG="/var/log/suricata/fast.log"
+
+VERBOSE=0
+[[ "${1:-}" == "-v" || "${1:-}" == "--verbose" ]] && VERBOSE=1
+
+# === HELPER FUNCTIONS ===
+
+log() {
+    [[ $VERBOSE -eq 1 ]] && echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+log_error() {
+    echo "[ERROR] $*" >&2
+}
+
+# Ensure state directory exists
+init_state_dir() {
+    if [[ ! -d "$STATE_DIR" ]]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || {
+            log_error "Cannot create state directory $STATE_DIR"
+            exit 1
+        }
+    fi
+}
+
+# Lock file to prevent concurrent runs
+acquire_lock() {
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+        log_error "Another instance is running. Exiting."
+        exit 0
+    fi
+    trap 'rm -f "$LOCK_FILE"' EXIT
+}
+
+# SQL-safe escaping (escape single quotes)
+sql_escape() {
+    echo "${1//\'/\'\'}"
+}
+
+# Generate hash for deduplication
+line_hash() {
+    echo -n "$1" | md5sum | cut -d' ' -f1
+}
+
+# Check if entry already exists (by hash)
+entry_exists() {
+    local hash="$1"
+    local count
+    count=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM seer_system_logs WHERE extra LIKE '%hash:$hash%';" 2>/dev/null || echo "0")
+    [[ "$count" -gt 0 ]]
+}
+
+# Parse syslog timestamp (handles missing year)
+parse_syslog_ts() {
+    local raw_ts="$1"
+    local year
+    year=$(date +%Y)
+    
+    # Try parsing with current year
+    if date -u -d "$year $raw_ts" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null; then
+        return
+    fi
+    
+    # Fallback: return current timestamp
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+# Insert log entry with deduplication
+insert_log() {
+    local ts="$1"
+    local log_type="$2"
+    local source="$3"
+    local message="$4"
+    local extra="$5"
+    local hash="$6"
+    
+    # Escape for SQL
+    source=$(sql_escape "$source")
+    message=$(sql_escape "$message")
+    extra=$(sql_escape "$extra")
+    
+    # Append hash to extra for deduplication tracking
+    extra="${extra}|hash:${hash}"
+    
+    # Check if already exists
+    if entry_exists "$hash"; then
+        log "Skipping duplicate: $log_type - ${message:0:50}..."
+        return 0
+    fi
+    
+    sqlite3 "$DB_PATH" <<EOF
+INSERT INTO seer_system_logs (timestamp, log_type, source, message, extra)
+VALUES ('$ts', '$log_type', '$source', '$message', '$extra');
+EOF
+    log "Inserted: $log_type - ${message:0:50}..."
+}
+
+# Get last processed position for a log file
+get_last_position() {
+    local log_name="$1"
+    local state_file="$STATE_DIR/${log_name}_pos"
+    if [[ -f "$state_file" ]]; then
+        cat "$state_file"
+    else
+        echo "0"
+    fi
+}
+
+# Save last processed position
+save_position() {
+    local log_name="$1"
+    local position="$2"
+    echo "$position" > "$STATE_DIR/${log_name}_pos"
+}
+
+# Get current file size
+get_file_size() {
+    stat -c%s "$1" 2>/dev/null || echo "0"
+}
+
+# === MAIN PROCESSING FUNCTIONS ===
+
+# --- 1. NETWORK (PORT) ACCESS ---
+process_firewall_log() {
+    log "Processing firewall log..."
+    
+    [[ ! -f "$FIREWALL_LOG" ]] && { log "Firewall log not found"; return 0; }
+    
+    local last_pos
+    last_pos=$(get_last_position "firewall")
+    local current_size
+    current_size=$(get_file_size "$FIREWALL_LOG")
+    
+    # Handle log rotation (file smaller than last position)
+    [[ "$current_size" -lt "$last_pos" ]] && last_pos=0
+    
+    local count=0
+    while read -r line; do
+        local PORT SRC DST TS MSG HASH
+        PORT=$(echo "$line" | grep -oP "DPT=\K[0-9]+" || echo "unknown")
+        SRC=$(echo "$line" | grep -oP "SRC=\K[\d\.]+" || echo "unknown")
+        DST=$(echo "$line" | grep -oP "DST=\K[\d\.]+" || echo "unknown")
+        TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        MSG="Network activity: SRC=$SRC DST=$DST DPT=$PORT"
+        HASH=$(line_hash "$line")
+        
+        insert_log "$TS" "PORT" "$SRC" "$MSG" "$line" "$HASH"
+        ((count++)) || true
+    done < <(tail -c +$((last_pos + 1)) "$FIREWALL_LOG" 2>/dev/null | grep -E "DPT=" || true)
+    
+    save_position "firewall" "$current_size"
+    log "Firewall: processed $count new entries"
+}
+
+# --- 2. USER LOGIN ATTEMPTS ---
+process_login_attempts() {
+    log "Processing login attempts..."
+    
+    [[ ! -f "$AUTH_LOG" ]] && { log "Auth log not found"; return 0; }
+    
+    local last_pos
+    last_pos=$(get_last_position "auth_login")
+    local current_size
+    current_size=$(get_file_size "$AUTH_LOG")
+    
+    [[ "$current_size" -lt "$last_pos" ]] && last_pos=0
+    
+    local count=0
+    while read -r line; do
+        local RAW_TS TSFMT USER STATUS SRC HASH
+        RAW_TS=$(echo "$line" | awk '{print $1,$2,$3}')
+        TSFMT=$(parse_syslog_ts "$RAW_TS")
+        USER=$(echo "$line" | grep -oP "for (invalid user )?\K\w+" || echo "unknown")
+        STATUS=$(echo "$line" | grep -oE "Accepted|Failed" || echo "unknown")
+        SRC=$(echo "$line" | grep -oP "from \K[\d\.]+" || echo "unknown")
+        HASH=$(line_hash "$line")
+        
+        insert_log "$TSFMT" "LOGIN" "$USER" "$line" "status:$STATUS|src:$SRC" "$HASH"
+        ((count++)) || true
+    done < <(tail -c +$((last_pos + 1)) "$AUTH_LOG" 2>/dev/null | grep -E "sshd.*(Accepted|Failed) password" || true)
+    
+    save_position "auth_login" "$current_size"
+    log "Login: processed $count new entries"
+}
+
+# --- 3. SUDO/SU ATTEMPTS ---
+process_sudo_attempts() {
+    log "Processing sudo attempts..."
+    
+    [[ ! -f "$AUTH_LOG" ]] && { log "Auth log not found"; return 0; }
+    
+    local last_pos
+    last_pos=$(get_last_position "auth_sudo")
+    local current_size
+    current_size=$(get_file_size "$AUTH_LOG")
+    
+    [[ "$current_size" -lt "$last_pos" ]] && last_pos=0
+    
+    local count=0
+    while read -r line; do
+        local RAW_TS TSFMT USER CMD HASH
+        RAW_TS=$(echo "$line" | awk '{print $1,$2,$3}')
+        TSFMT=$(parse_syslog_ts "$RAW_TS")
+        USER=$(echo "$line" | grep -oP "user=\K\w+" || echo "$line" | grep -oP "^\w+ \d+ [\d:]+ \w+ sudo:\s+\K\w+" || echo "unknown")
+        CMD=$(echo "$line" | grep -oP "COMMAND=\K.*" || echo "")
+        HASH=$(line_hash "$line")
+        
+        insert_log "$TSFMT" "SUDO" "$USER" "$line" "cmd:$CMD" "$HASH"
+        ((count++)) || true
+    done < <(tail -c +$((last_pos + 1)) "$AUTH_LOG" 2>/dev/null | grep -E "sudo:.*COMMAND=|sudo:.*authentication" || true)
+    
+    save_position "auth_sudo" "$current_size"
+    log "Sudo: processed $count new entries"
+}
+
+# --- 4. SYSLOG ERROR/WARNING ---
+process_syslog_errors() {
+    log "Processing syslog errors/warnings..."
+    
+    [[ ! -f "$SYSLOG" ]] && { log "Syslog not found"; return 0; }
+    
+    local last_pos
+    last_pos=$(get_last_position "syslog")
+    local current_size
+    current_size=$(get_file_size "$SYSLOG")
+    
+    [[ "$current_size" -lt "$last_pos" ]] && last_pos=0
+    
+    local count=0
+    while read -r line; do
+        local RAW_TS TSFMT PROC HASH
+        RAW_TS=$(echo "$line" | awk '{print $1,$2,$3}')
+        TSFMT=$(parse_syslog_ts "$RAW_TS")
+        PROC=$(echo "$line" | awk '{print $5}' | tr -d ':' | cut -d'[' -f1)
+        HASH=$(line_hash "$line")
+        insert_log "$TSFMT" "SYSLOG" "$PROC" "$line" "" "$HASH"
+        ((count++)) || true
+    done < <(tail -c +$((last_pos + 1)) "$SYSLOG" 2>/dev/null | grep -iE "error|fail|warn|critical" | grep -vE "seer_monitor|No error" | head -1000 || true)
+    
+    save_position "syslog" "$current_size"
+    log "Syslog: processed $count new entries"
+}
+
+# --- 5. FILE ACCESS (AUDITD) ---
+process_file_access() {
+    log "Processing file access logs..."
+    
+    [[ ! -f "$AUDIT_LOG" ]] && { log "Audit log not found (auditd may not be installed)"; return 0; }
+    
+    local last_pos
+    last_pos=$(get_last_position "audit")
+    local current_size
+    current_size=$(get_file_size "$AUDIT_LOG")
+    
+    [[ "$current_size" -lt "$last_pos" ]] && last_pos=0
+    
+    local count=0
+    while read -r line; do
+        # Extract key fields from audit log
+        local TS_EPOCH FILE_PATH USER_ID PROC_NAME SYSCALL HASH
+        
+        TS_EPOCH=$(echo "$line" | grep -oP "msg=audit\(\K[0-9]+\.[0-9]+" || echo "")
+        FILE_PATH=$(echo "$line" | grep -oP 'name="?\K[^"]+' | head -1 || echo "unknown")
+        USER_ID=$(echo "$line" | grep -oP "uid=\K[0-9]+" || echo "unknown")
+        PROC_NAME=$(echo "$line" | grep -oP 'comm="\K[^"]+' || echo "unknown")
+        SYSCALL=$(echo "$line" | grep -oP "syscall=\K[0-9]+" || echo "unknown")
+        
+        # Convert epoch to ISO timestamp
+        local TSFMT
+        if [[ -n "$TS_EPOCH" ]]; then
+            TSFMT=$(date -u -d "@${TS_EPOCH%.*}" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u +"%Y-%m-%dT%H:%M:%SZ")
+        else
+            TSFMT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        fi
+        
+        # Get username from UID
+        local USERNAME
+        USERNAME=$(getent passwd "$USER_ID" | cut -d: -f1 || echo "uid:$USER_ID")
+        
+        # Create readable message
+        local MSG="File access: $FILE_PATH by $PROC_NAME (user: $USERNAME)"
+        
+        HASH=$(line_hash "$line")
+        
+        insert_log "$TSFMT" "FILE_ACCESS" "$USERNAME" "$MSG" "file:$FILE_PATH|proc:$PROC_NAME|syscall:$SYSCALL" "$HASH"
+        ((count++)) || true
+    done < <(tail -c +$((last_pos + 1)) "$AUDIT_LOG" 2>/dev/null | grep -E "type=SYSCALL.*name=" | head -1000 || true)
+    
+    save_position "audit" "$current_size"
+    log "File access: processed $count new entries"
+}
+
+# --- 6. SURICATA IDS ALERTS ---
+process_suricata_alerts() {
+    log "Processing Suricata IDS alerts..."
+    
+    [[ ! -f "$SURICATA_EVE_LOG" ]] && { log "Suricata EVE log not found (Suricata may not be installed)"; return 0; }
+    
+    # Check if jq is available for JSON parsing
+    if ! command -v jq &> /dev/null; then
+        log "jq not found, skipping Suricata alerts (install with: apt-get install jq)"
+        return 0
+    fi
+    
+    local last_pos
+    last_pos=$(get_last_position "suricata_eve")
+    local current_size
+    current_size=$(get_file_size "$SURICATA_EVE_LOG")
+    
+    [[ "$current_size" -lt "$last_pos" ]] && last_pos=0
+    
+    local count=0
+    while IFS= read -r line; do
+        # Skip empty lines
+        [[ -z "$line" ]] && continue
+        
+        # Parse JSON fields using jq
+        local EVENT_TYPE TIMESTAMP ALERT_SIG ALERT_CAT ALERT_SEV SRC_IP DST_IP SRC_PORT DST_PORT PROTO HASH
+        
+        EVENT_TYPE=$(echo "$line" | jq -r '.event_type // "unknown"' 2>/dev/null || echo "unknown")
+        
+        # Only process alert events
+        [[ "$EVENT_TYPE" != "alert" ]] && continue
+        
+        TIMESTAMP=$(echo "$line" | jq -r '.timestamp // ""' 2>/dev/null || echo "")
+        ALERT_SIG=$(echo "$line" | jq -r '.alert.signature // "Unknown Alert"' 2>/dev/null || echo "Unknown Alert")
+        ALERT_CAT=$(echo "$line" | jq -r '.alert.category // "Unknown"' 2>/dev/null || echo "Unknown")
+        ALERT_SEV=$(echo "$line" | jq -r '.alert.severity // "3"' 2>/dev/null || echo "3")
+        SRC_IP=$(echo "$line" | jq -r '.src_ip // "unknown"' 2>/dev/null || echo "unknown")
+        DST_IP=$(echo "$line" | jq -r '.dest_ip // "unknown"' 2>/dev/null || echo "unknown")
+        SRC_PORT=$(echo "$line" | jq -r '.src_port // "0"' 2>/dev/null || echo "0")
+        DST_PORT=$(echo "$line" | jq -r '.dest_port // "0"' 2>/dev/null || echo "0")
+        PROTO=$(echo "$line" | jq -r '.proto // "unknown"' 2>/dev/null || echo "unknown")
+        
+        # Convert timestamp to ISO format if needed
+        local TSFMT
+        if [[ -n "$TIMESTAMP" ]]; then
+            TSFMT="$TIMESTAMP"
+        else
+            TSFMT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        fi
+        
+        # Determine log type based on severity
+        local LOG_TYPE
+        case "$ALERT_SEV" in
+            1) LOG_TYPE="ALERT_CRITICAL" ;;
+            2) LOG_TYPE="ALERT_HIGH" ;;
+            3) LOG_TYPE="ALERT_MEDIUM" ;;
+            *) LOG_TYPE="ALERT_LOW" ;;
+        esac
+        
+        # Create readable message
+        local MSG="IDS Alert: $ALERT_SIG"
+        local EXTRA="category:$ALERT_CAT|severity:$ALERT_SEV|src:$SRC_IP:$SRC_PORT|dst:$DST_IP:$DST_PORT|proto:$PROTO"
+        
+        HASH=$(line_hash "$line")
+        
+        insert_log "$TSFMT" "$LOG_TYPE" "$SRC_IP" "$MSG" "$EXTRA" "$HASH"
+        ((count++)) || true
+    done < <(tail -c +$((last_pos + 1)) "$SURICATA_EVE_LOG" 2>/dev/null || true)
+    
+    save_position "suricata_eve" "$current_size"
+    log "Suricata: processed $count new alerts"
+}
+
+# === MAIN EXECUTION ===
+
+main() {
+    log "Starting Seer Activity Monitor..."
+    
+    # Validate database exists
+    if [[ ! -f "$DB_PATH" ]]; then
+        log_error "Database not found: $DB_PATH"
+        exit 1
+    fi
+    
+    init_state_dir
+    acquire_lock
+    
+    # Process all log sources
+    process_firewall_log
+    process_login_attempts
+    process_sudo_attempts
+    process_syslog_errors
+    process_file_access
+    process_suricata_alerts
+    
+    log "Seer Activity Monitor completed."
+}
+
+main "$@"

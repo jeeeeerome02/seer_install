@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+    <head>
+        <link rel="stylesheet" type="text/css" href="main.css" />
+        <title>testmyNIDS.org | tmNIDS.sh</title>
+    </head>
+
+    <body>
+        <article>
+            <h1>Hey! What's up?</h1>
+            <div>
+                <p>This page is just a placeholder, as this website doesn't have anything worth browsing. Its purpose is explained in the project <a href="https://github.com/3CORESec/testmynids.org">Github page</a>. We do <strong>not</strong> host any illegal or malicious content.</p>
+                <p>&mdash; <a href="https://twitter.com/3CORESec">@3CORESec</a></p>
+            </div>
+        </article>
+    </body>
+</html>
+
